@@ -7,7 +7,7 @@ Quick start:
     text = transcribe(model, "audio.wav")
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.0"
 
 from .inference import (
     load_model as load_model,
