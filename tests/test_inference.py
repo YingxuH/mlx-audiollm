@@ -1,10 +1,13 @@
-"""Tests for inference module (n-gram sampler, utilities)."""
+"""Tests for inference module (n-gram sampler, utilities, embedding merge)."""
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_meralion.inference import (
     NO_REPEAT_NGRAM_SIZE,
     _wrap_sampler_with_ngram_blocking,
+    build_merged_embeddings,
+    build_merged_embeddings_single,
     is_converted_dir,
     is_raw_hf_dir,
     make_no_repeat_ngram_sampler,
@@ -128,3 +131,95 @@ class TestDirectoryDetection:
     def test_is_raw_hf_dir_missing_safetensors(self, tmp_path):
         (tmp_path / "config.json").write_text("{}")
         assert is_raw_hf_dir(tmp_path) is False
+
+
+class _FakeEmbedTokens(nn.Embedding):
+    """Minimal embedding layer for testing."""
+
+    def __init__(self, vocab_size, hidden_size):
+        super().__init__(vocab_size, hidden_size)
+
+
+class _FakeInnerModel:
+    def __init__(self, vocab_size, hidden_size):
+        self.embed_tokens = _FakeEmbedTokens(vocab_size, hidden_size)
+
+
+class _FakeDecoderModel:
+    def __init__(self, vocab_size=256000, hidden_size=16):
+        self.model = _FakeInnerModel(vocab_size, hidden_size)
+
+
+class TestBuildMergedEmbeddings:
+    """Tests for vectorized build_merged_embeddings."""
+
+    def test_replaces_speech_tokens(self):
+        H = 16
+        decoder = _FakeDecoderModel(hidden_size=H)
+        speech_token = 255999
+        # Sequence: [10, 255999, 255999, 20]
+        input_ids = mx.array([[10, speech_token, speech_token, 20]])
+        speech_embeds = mx.ones((1, 2, H)) * 99.0
+
+        result = build_merged_embeddings(decoder, input_ids, speech_embeds, speech_token)
+        mx.eval(result)
+
+        # Positions 1 and 2 should have speech embeddings (all 99s)
+        assert result.shape == (1, 4, H)
+        assert float(mx.mean(result[0, 1, :])) > 90  # speech embedding, not text
+        assert float(mx.mean(result[0, 2, :])) > 90
+
+    def test_preserves_text_tokens(self):
+        H = 16
+        decoder = _FakeDecoderModel(hidden_size=H)
+        speech_token = 255999
+        input_ids = mx.array([[10, speech_token, 20]])
+        speech_embeds = mx.ones((1, 1, H)) * 99.0
+
+        result = build_merged_embeddings(decoder, input_ids, speech_embeds, speech_token)
+        mx.eval(result)
+
+        # Compare text positions: should match original embed_tokens output
+        original = decoder.model.embed_tokens(input_ids)
+        mx.eval(original)
+        assert mx.allclose(result[0, 0, :], original[0, 0, :], atol=1e-5)
+        assert mx.allclose(result[0, 2, :], original[0, 2, :], atol=1e-5)
+
+    def test_no_speech_tokens(self):
+        H = 16
+        decoder = _FakeDecoderModel(hidden_size=H)
+        input_ids = mx.array([[10, 20, 30]])
+        speech_embeds = mx.ones((1, 0, H))
+
+        result = build_merged_embeddings(decoder, input_ids, speech_embeds, 255999)
+        original = decoder.model.embed_tokens(input_ids)
+        mx.eval(result, original)
+        assert mx.allclose(result, original, atol=1e-5)
+
+
+class TestBuildMergedEmbeddingsSingle:
+    """Tests for the single-sequence optimized path."""
+
+    def test_replaces_speech_tokens_1d(self):
+        H = 16
+        decoder = _FakeDecoderModel(hidden_size=H)
+        speech_token = 255999
+        input_ids = mx.array([10, speech_token, speech_token, 20])
+        speech_embeds = mx.ones((1, 2, H)) * 99.0
+
+        result = build_merged_embeddings_single(decoder, input_ids, speech_embeds, speech_token)
+        mx.eval(result)
+        assert result.shape == (1, 4, H)
+        assert float(mx.mean(result[0, 1, :])) > 90
+
+    def test_replaces_speech_tokens_2d(self):
+        H = 16
+        decoder = _FakeDecoderModel(hidden_size=H)
+        speech_token = 255999
+        input_ids = mx.array([[10, speech_token, 20]])
+        speech_embeds = mx.ones((1, 1, H)) * 99.0
+
+        result = build_merged_embeddings_single(decoder, input_ids, speech_embeds, speech_token)
+        mx.eval(result)
+        assert result.shape == (1, 3, H)
+        assert float(mx.mean(result[0, 1, :])) > 90

@@ -12,6 +12,7 @@ __version__ = "0.1.0"
 from .inference import (
     load_model as load_model,
     transcribe as transcribe,
+    batch_transcribe as batch_transcribe,
     LoadedModel as LoadedModel,
 )
 from .processor import get_task_prompt as get_task_prompt

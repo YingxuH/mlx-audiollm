@@ -451,20 +451,83 @@ def build_merged_embeddings(
 
     Returns UNscaled embeddings because the model's __call__ applies
     sqrt(hidden_size) scaling internally after embed_tokens.
+
+    Uses vectorized operations instead of Python loops for efficiency.
     """
     embed_fn = decoder_model.model.embed_tokens
     text_embeds = embed_fn(input_ids)
 
-    B, S, H = text_embeds.shape
+    # Boolean mask: True where speech tokens should be inserted
+    speech_mask = input_ids == speech_token_index  # (B, S)
 
+    B, S, H = text_embeds.shape
+    N_speech = speech_embeds.shape[1]  # number of speech tokens per batch
+
+    # For each batch element, the speech_mask positions (in order) map 1:1
+    # to speech_embeds positions. We build a flat index to scatter speech
+    # embeddings into the correct positions.
     for b in range(B):
-        speech_idx = 0
-        for s in range(S):
-            if int(input_ids[b, s]) == speech_token_index and speech_idx < speech_embeds.shape[1]:
-                text_embeds = text_embeds.at[b, s].add(
-                    speech_embeds[b, speech_idx] - text_embeds[b, s]
-                )
-                speech_idx += 1
+        # Find positions where speech tokens appear using mx.where
+        mask_b = speech_mask[b]  # (S,)
+        indices = mx.arange(S)
+        # Select indices where mask is True, fill rest with S (out of bounds sentinel)
+        speech_positions = mx.where(mask_b, indices, mx.full(indices.shape, S))
+        speech_positions = mx.sort(speech_positions)
+        # Count actual speech positions (those < S)
+        n_actual = int(mx.sum(mask_b))
+        n_pos = min(n_actual, N_speech)
+        # Replace text embeddings at speech positions with speech embeddings
+        for i in range(n_pos):
+            pos = int(speech_positions[i])
+            text_embeds = text_embeds.at[b, pos].add(
+                speech_embeds[b, i] - text_embeds[b, pos]
+            )
+
+    return text_embeds
+
+
+def build_merged_embeddings_single(
+    decoder_model,
+    input_ids: mx.array,
+    speech_embeds: mx.array,
+    speech_token_index: int,
+) -> mx.array:
+    """Build merged embeddings for a single (unbatched) sequence.
+
+    Optimized path for single-sequence inference: avoids batch-dim loops,
+    uses mx.argwhere + scatter for O(1) Python overhead regardless of
+    sequence length.
+
+    Args:
+        decoder_model: Gemma2 decoder with embed_tokens
+        input_ids: (1, S) or (S,) token IDs
+        speech_embeds: (1, N, H) speech embeddings from adaptor
+        speech_token_index: token ID for <SpeechHere> (e.g. 255999)
+
+    Returns:
+        (1, S, H) merged embeddings (unscaled)
+    """
+    if input_ids.ndim == 1:
+        input_ids = input_ids[None, :]
+    if speech_embeds.ndim == 2:
+        speech_embeds = speech_embeds[None, :, :]
+
+    embed_fn = decoder_model.model.embed_tokens
+    text_embeds = embed_fn(input_ids)  # (1, S, H)
+
+    mask = input_ids[0] == speech_token_index
+    S = input_ids.shape[1]
+    indices = mx.arange(S)
+    speech_positions = mx.where(mask, indices, mx.full(indices.shape, S))
+    speech_positions = mx.sort(speech_positions)
+    n_actual = int(mx.sum(mask))
+    n_pos = min(n_actual, speech_embeds.shape[1])
+
+    for i in range(n_pos):
+        pos = int(speech_positions[i])
+        text_embeds = text_embeds.at[0, pos].add(
+            speech_embeds[0, i] - text_embeds[0, pos]
+        )
 
     return text_embeds
 
@@ -695,6 +758,233 @@ def transcribe(
         parts.append(text.strip())
 
     return " ".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Batch inference
+# ---------------------------------------------------------------------------
+
+
+def _encode_audio(model: LoadedModel, audio_array: np.ndarray, verbose: bool = False):
+    """Encode a single audio array through encoder + adaptor.
+
+    Returns speech embeddings ready for merging into text sequence.
+    """
+    mel_features, num_chunks = model.processor.prepare_audio(
+        audio_array=audio_array,
+        max_duration=None,
+    )
+    mel_mx = mx.array(mel_features)
+
+    chunk_embeds = []
+    for i in range(num_chunks):
+        chunk_mel = mel_mx[i : i + 1]
+        enc_out = model.encoder(chunk_mel)
+        enc_out = model.ln_speech(enc_out)
+        chunk_speech = model.adaptor(enc_out)
+        chunk_embeds.append(chunk_speech)
+    speech_embeds = mx.concatenate(chunk_embeds, axis=1)
+    mx.eval(speech_embeds)
+    return speech_embeds, num_chunks
+
+
+def _prepare_embeddings(
+    model: LoadedModel,
+    audio_array: np.ndarray,
+    instruction: str,
+) -> tuple[mx.array, mx.array]:
+    """Prepare merged embeddings and input_ids for one audio sample.
+
+    Returns:
+        (merged_embeds_2d, input_ids_1d) — both without batch dimension
+    """
+    speech_embeds, num_chunks = _encode_audio(model, audio_array)
+    text_inputs = model.processor.prepare_text(instruction, num_chunks=num_chunks)
+    input_ids = mx.array(text_inputs["input_ids"])
+
+    merged_embeds = build_merged_embeddings_single(
+        model.decoder,
+        input_ids,
+        speech_embeds,
+        model.processor.speech_token_index,
+    )
+    return merged_embeds[0], input_ids[0]
+
+
+def _left_pad_embeddings(embeds_list: list[mx.array]) -> tuple[mx.array, list[int]]:
+    """Left-pad a list of 2D embedding tensors to the same length.
+
+    Args:
+        embeds_list: List of (seq_len_i, H) tensors
+
+    Returns:
+        (B, max_seq_len, H) padded tensor and list of left-padding amounts
+    """
+    lengths = [e.shape[0] for e in embeds_list]
+    max_len = max(lengths)
+    H = embeds_list[0].shape[-1]
+    padding = [max_len - l for l in lengths]
+
+    padded = []
+    for embed, pad in zip(embeds_list, padding):
+        if pad > 0:
+            pad_tensor = mx.zeros((pad, H))
+            padded.append(mx.concatenate([pad_tensor, embed], axis=0))
+        else:
+            padded.append(embed)
+    return mx.stack(padded), padding
+
+
+def _left_pad_ids(ids_list: list[mx.array]) -> mx.array:
+    """Left-pad a list of 1D token ID tensors to the same length."""
+    lengths = [len(ids) for ids in ids_list]
+    max_len = max(lengths)
+    return mx.array([[0] * (max_len - len(ids)) + ids.tolist() for ids in ids_list])
+
+
+def batch_transcribe(
+    model: LoadedModel,
+    audios: list[str | np.ndarray],
+    task: str = "asr",
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+    verbose: bool = False,
+    **task_kwargs,
+) -> list[str]:
+    """Transcribe multiple audio files in a true GPU-batched decode.
+
+    Uses the mlx-vlm BatchGenerator pattern: pre-compute merged embeddings
+    for all audio, left-pad to uniform length, batch prefill with embeddings,
+    then batch decode with token IDs only (embeddings baked into KV cache).
+
+    Args:
+        model: LoadedModel from load_model()
+        audios: List of audio file paths or pre-loaded 16kHz float32 arrays
+        task: Task key (asr, translate_zh, etc.)
+        max_new_tokens: Maximum tokens to generate per audio
+        temperature: Sampling temperature (0 = greedy)
+        verbose: Print progress info
+        **task_kwargs: Extra args for task prompt
+
+    Returns:
+        List of generated text strings, one per audio
+    """
+    from mlx_lm import cache as lm_cache
+    from mlx_lm.models.base import create_attention_mask
+
+    instruction = get_task_prompt(task, **task_kwargs)
+    B = len(audios)
+
+    if verbose:
+        print(f"Batch transcribe: {B} audio(s), task={task}")
+
+    # Phase 1: Load audio
+    audio_arrays = []
+    for audio in audios:
+        if isinstance(audio, (str, Path)):
+            audio_arrays.append(load_audio(str(audio)))
+        else:
+            audio_arrays.append(audio)
+
+    # Phase 2: Encode all audio + build merged embeddings (per-item)
+    t0 = time.time()
+    all_embeds = []  # list of (seq_len_i, H) — no batch dim
+    all_input_ids = []  # list of (seq_len_i,) — no batch dim
+    for audio_array in audio_arrays:
+        embeds, ids = _prepare_embeddings(model, audio_array, instruction)
+        all_embeds.append(embeds)
+        all_input_ids.append(ids)
+
+    if verbose:
+        lens = [e.shape[0] for e in all_embeds]
+        print(f"  Encoded {B} audio(s) in {time.time() - t0:.2f}s, seq_lens={lens}")
+
+    # Phase 3: Left-pad to uniform length for batching
+    batched_embeds, padding = _left_pad_embeddings(all_embeds)  # (B, S, H)
+    batched_ids = _left_pad_ids(all_input_ids)  # (B, S)
+    mx.eval(batched_embeds, batched_ids)
+
+    # Phase 4: Create batch-aware KV cache (handles left-padding offsets)
+    batch_cache = [lm_cache.BatchKVCache(padding) for _ in model.decoder.model.layers]
+
+    # Phase 5: Prefill with embeddings — bakes audio info into KV cache
+    t0 = time.time()
+    prefill_step_size = 2048
+    embeds_remaining = batched_embeds
+    ids_remaining = batched_ids
+
+    while embeds_remaining.shape[1] > 1:
+        n = min(prefill_step_size, embeds_remaining.shape[1] - 1)
+        model.decoder(
+            ids_remaining[:, :n],
+            cache=batch_cache,
+            input_embeddings=embeds_remaining[:, :n],
+        )
+        mx.eval([c.state for c in batch_cache])
+        embeds_remaining = embeds_remaining[:, n:]
+        ids_remaining = ids_remaining[:, n:]
+        mx.clear_cache()
+
+    # Process last token to get first generated token
+    logits = model.decoder(
+        ids_remaining,
+        cache=batch_cache,
+        input_embeddings=embeds_remaining,
+    )
+    logits = logits[:, -1, :]  # (B, vocab)
+
+    if verbose:
+        print(f"  Prefill done in {time.time() - t0:.2f}s")
+
+    # Phase 6: Batched autoregressive decode — token IDs only
+    t0 = time.time()
+    sampler = (lambda x: mx.argmax(x, axis=-1))
+
+    eos_tokens = {1, 107}
+    if (
+        hasattr(model.processor.tokenizer, "eos_token_id")
+        and model.processor.tokenizer.eos_token_id is not None
+    ):
+        eos_tokens.add(model.processor.tokenizer.eos_token_id)
+
+    generated = [[] for _ in range(B)]
+    active = [True] * B
+
+    for step in range(max_new_tokens):
+        # Sample next tokens
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        y = sampler(logprobs)  # (B,)
+        mx.eval(y)
+
+        # Check EOS per sequence
+        y_list = y.tolist()
+        any_active = False
+        for i in range(B):
+            if not active[i]:
+                continue
+            tid = y_list[i]
+            if tid in eos_tokens:
+                active[i] = False
+            else:
+                generated[i].append(tid)
+                any_active = True
+
+        if not any_active:
+            break
+
+        # Forward pass with just token IDs (KV cache has the context)
+        logits = model.decoder(y[:, None], cache=batch_cache)
+        logits = logits[:, -1, :]
+
+    gen_time = time.time() - t0
+    results = [model.processor.decode(g) for g in generated]
+
+    if verbose:
+        total_tokens = sum(len(g) for g in generated)
+        tps = total_tokens / gen_time if gen_time > 0 else 0
+        print(f"  Generated {total_tokens} tokens in {gen_time:.2f}s ({tps:.1f} tok/s)")
+
+    return results
 
 
 def _format_time(seconds: float) -> str:
