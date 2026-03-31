@@ -86,6 +86,52 @@ def make_no_repeat_ngram_sampler(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
     return sampler
 
 
+def _wrap_sampler_with_ngram_blocking(base_sampler, ngram_size: int = NO_REPEAT_NGRAM_SIZE):
+    """Wrap any sampler (including temperature>0) with n-gram blocking.
+
+    Runs the base sampler first, then checks if the chosen token would
+    create a repeated n-gram. If so, falls back to the next-best token
+    by logit ranking (ignoring the base sampler's stochastic choice).
+
+    For temperature=0 (base_sampler is None), uses the greedy n-gram sampler.
+    """
+    if base_sampler is None:
+        return make_no_repeat_ngram_sampler(ngram_size)
+
+    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
+    id_list: list[int] = []
+
+    def _register(token: int):
+        id_list.append(token)
+        if len(id_list) >= ngram_size:
+            prefix = tuple(id_list[-ngram_size:-1])
+            if prefix not in prefix_to_next:
+                prefix_to_next[prefix] = set()
+            prefix_to_next[prefix].add(id_list[-1])
+
+    def wrapped_sampler(logits: mx.array) -> mx.array:
+        token = base_sampler(logits)
+        tid = int(token.reshape(-1)[0]) if token.ndim > 0 else int(token)
+
+        if len(id_list) >= ngram_size - 1:
+            ctx = tuple(id_list[-(ngram_size - 1):])
+            banned = prefix_to_next.get(ctx)
+            if banned and tid in banned:
+                flat = logits.reshape(-1) if logits.ndim == 2 else logits
+                sorted_ids = mx.argsort(flat)[::-1]
+                for candidate in sorted_ids:
+                    cid = int(candidate)
+                    if cid not in banned:
+                        tid = cid
+                        token = candidate.reshape(token.shape)
+                        break
+
+        _register(tid)
+        return token
+
+    return wrapped_sampler
+
+
 # ---------------------------------------------------------------------------
 # Model directory detection and auto-conversion
 # ---------------------------------------------------------------------------
@@ -529,11 +575,14 @@ def _infer_segment(
     )
     mx.eval(merged_embeds)
 
-    # Generate with n-gram blocking sampler
+    # Generate with n-gram blocking always enabled (greedy and sampling)
+    from mlx_lm.sample_utils import make_sampler
+
     prompt_tokens = input_ids[0]
     embeddings_2d = merged_embeds[0]
 
-    sampler = make_no_repeat_ngram_sampler(NO_REPEAT_NGRAM_SIZE)
+    base_sampler = make_sampler(temp=temperature) if temperature > 0 else None
+    sampler = _wrap_sampler_with_ngram_blocking(base_sampler, NO_REPEAT_NGRAM_SIZE)
 
     eos_tokens = {1, 107}
     if (

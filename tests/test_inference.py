@@ -4,6 +4,7 @@ import mlx.core as mx
 
 from mlx_meralion.inference import (
     NO_REPEAT_NGRAM_SIZE,
+    _wrap_sampler_with_ngram_blocking,
     is_converted_dir,
     is_raw_hf_dir,
     make_no_repeat_ngram_sampler,
@@ -73,6 +74,37 @@ class TestNoRepeatNgramSampler:
         token = sampler(logits)
         mx.eval(token)
         assert int(token) != 3
+
+
+class TestWrapSamplerWithNgramBlocking:
+    """Tests for _wrap_sampler_with_ngram_blocking()."""
+
+    def test_none_base_returns_greedy_sampler(self):
+        sampler = _wrap_sampler_with_ngram_blocking(None, 3)
+        logits = mx.array([0.1, 0.5, 0.3, 0.8, 0.2])
+        token = sampler(logits)
+        mx.eval(token)
+        assert int(token) == 3  # greedy argmax
+
+    def test_wraps_existing_sampler(self):
+        def always_zero(logits):
+            return mx.array(0)
+
+        wrapped = _wrap_sampler_with_ngram_blocking(always_zero, 2)
+        logits = mx.array([10.0, 5.0, 3.0])
+
+        # First two calls: token 0 allowed, registers (0)->0
+        token = wrapped(logits)
+        mx.eval(token)
+        assert int(token) == 0
+        token = wrapped(logits)
+        mx.eval(token)
+        assert int(token) == 0
+
+        # Third call: context (0), token 0 banned, falls back to logit ranking
+        token = wrapped(logits)
+        mx.eval(token)
+        assert int(token) != 0
 
 
 class TestDirectoryDetection:
