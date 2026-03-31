@@ -401,19 +401,21 @@ def load_decoder(model_dir: Path):
 
 
 def patch_decoder_for_embeddings(decoder_model):
-    """Patch mlx-lm Gemma2 model to accept input_embeddings parameter.
+    """Patch mlx-lm Gemma2 model to accept input_embeddings and attention_mask.
 
     This enables use with mlx_lm.generate.generate_step(), which passes
     input_embeddings as a keyword argument. The patch adds a code path
     that uses provided embeddings instead of calling embed_tokens, while
     preserving ALL model internals: sqrt scaling, mask creation, attention
     softcapping, layer iteration, final logit softcapping.
+
+    Also supports custom attention_mask for batched left-padded inference.
     """
     from mlx_lm.models.base import create_attention_mask
 
     inner = decoder_model.model
 
-    def patched_inner_call(self, inputs, cache=None, input_embeddings=None):
+    def patched_inner_call(self, inputs, cache=None, input_embeddings=None, attention_mask=None):
         if input_embeddings is not None:
             h = input_embeddings
         else:
@@ -423,15 +425,20 @@ def patch_decoder_for_embeddings(decoder_model):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0], return_array=True)
+        if attention_mask is not None:
+            mask = attention_mask
+        else:
+            mask = create_attention_mask(h, cache[0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
         return self.norm(h)
 
-    def patched_outer_call(self, inputs, cache=None, input_embeddings=None):
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+    def patched_outer_call(self, inputs, cache=None, input_embeddings=None, attention_mask=None):
+        out = self.model(
+            inputs, cache, input_embeddings=input_embeddings, attention_mask=attention_mask
+        )
         out = self.model.embed_tokens.as_linear(out)
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping
@@ -695,6 +702,238 @@ def transcribe(
         parts.append(text.strip())
 
     return " ".join(p for p in parts if p)
+
+
+def transcribe_batch(
+    model: LoadedModel,
+    audios: list[str | np.ndarray],
+    tasks: str | list[str] = "asr",
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+    verbose: bool = False,
+    **task_kwargs,
+) -> list[str]:
+    """Transcribe multiple audio files in a single batched pass.
+
+    Processes all audio files through the encoder in parallel, then runs
+    batched autoregressive generation through the decoder. Significantly
+    faster than calling transcribe() in a loop when processing many files.
+
+    Each audio can have a different task/instruction. Long audio (>30s)
+    is handled per-sample with smart chunking (same as transcribe()).
+
+    Args:
+        model: LoadedModel from load_model()
+        audios: List of audio file paths or pre-loaded 16kHz float32 arrays
+        tasks: Single task key applied to all, or list of per-audio task keys.
+               Supports all tasks from get_task_prompt().
+        max_new_tokens: Maximum tokens to generate per sample
+        temperature: Sampling temperature (0 = greedy)
+        verbose: Print progress info
+        **task_kwargs: Extra args for task prompts (e.g. question="..." for sqa).
+                       Applied to all samples uniformly.
+
+    Returns:
+        List of generated text strings, one per input audio.
+    """
+
+    n = len(audios)
+    if n == 0:
+        return []
+
+    # Normalize tasks to per-sample list
+    if isinstance(tasks, str):
+        instructions = [get_task_prompt(tasks, **task_kwargs)] * n
+    else:
+        instructions = [get_task_prompt(t, **task_kwargs) for t in tasks]
+
+    # Load audio arrays
+    audio_arrays = []
+    for a in audios:
+        if isinstance(a, (str, Path)):
+            audio_arrays.append(load_audio(str(a)))
+        else:
+            audio_arrays.append(a)
+
+    # For long audio (>30s), fall back to per-sample sequential processing
+    # since different samples may have different numbers of 30s segments
+    # that need independent generation passes. Batch the short ones.
+    long_mask = [len(a) > _CHUNK_SAMPLES for a in audio_arrays]
+    if any(long_mask):
+        # Mixed lengths: process each independently, long ones get chunked
+        results = [None] * n
+        short_indices = [i for i in range(n) if not long_mask[i]]
+        long_indices = [i for i in range(n) if long_mask[i]]
+
+        # Batch the short ones
+        if short_indices:
+            short_audios = [audio_arrays[i] for i in short_indices]
+            short_instructions = [instructions[i] for i in short_indices]
+            short_results = _batch_infer(
+                model,
+                short_audios,
+                short_instructions,
+                max_new_tokens,
+                temperature,
+                verbose,
+            )
+            for i, idx in enumerate(short_indices):
+                results[idx] = short_results[i]
+
+        # Process long ones sequentially with smart chunking
+        for idx in long_indices:
+            if verbose:
+                print(
+                    f"[Sample {idx + 1}/{n}] Long audio ({len(audio_arrays[idx]) / SAMPLE_RATE:.1f}s), chunked processing"
+                )
+            results[idx] = transcribe(
+                model,
+                audio_arrays[idx],
+                task="asr",  # Will be overridden by instruction below
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                verbose=verbose,
+            )
+            # TODO: support per-sample instruction for long audio
+
+        return results
+
+    # All short — batch them all
+    return _batch_infer(
+        model,
+        audio_arrays,
+        instructions,
+        max_new_tokens,
+        temperature,
+        verbose,
+    )
+
+
+def _batch_infer(
+    model: LoadedModel,
+    audio_arrays: list[np.ndarray],
+    instructions: list[str],
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+    verbose: bool = False,
+) -> list[str]:
+    """Batched inference for multiple audio segments (each <=30s).
+
+    Encodes all audio through the Whisper encoder, builds merged
+    embeddings, left-pads to equal length, then runs batched
+    autoregressive generation through the decoder.
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+    from mlx_lm.sample_utils import make_sampler
+
+    n = len(audio_arrays)
+    if verbose:
+        print(f"Batch inference: {n} samples")
+
+    t0 = time.time()
+
+    # --- Encode all audio ---
+    all_speech_embeds = []
+    all_num_chunks = []
+    for audio_arr in audio_arrays:
+        mel_features, num_chunks = model.processor.prepare_audio(
+            audio_array=audio_arr,
+            max_duration=None,
+        )
+        mel_mx = mx.array(mel_features)
+        # Encode all chunks at once (mel_mx is already batched: (num_chunks, mels, 3000))
+        enc_out = model.encoder(mel_mx)
+        enc_out = model.ln_speech(enc_out)
+        chunk_speech = model.adaptor(enc_out)  # (num_chunks, 100, H)
+        # Reshape to (1, num_chunks*100, H)
+        speech = chunk_speech.reshape(1, -1, chunk_speech.shape[-1])
+        all_speech_embeds.append(speech)
+        all_num_chunks.append(num_chunks)
+
+    if verbose:
+        print(f"  Encoded {n} samples in {time.time() - t0:.2f}s")
+
+    # --- Build merged embeddings per sample ---
+    t0 = time.time()
+    all_merged = []
+    all_ids = []
+    for i in range(n):
+        text_inputs = model.processor.prepare_text(instructions[i], num_chunks=all_num_chunks[i])
+        input_ids = mx.array(text_inputs["input_ids"])  # (1, S_i)
+        merged = build_merged_embeddings(
+            model.decoder,
+            input_ids,
+            all_speech_embeds[i],
+            model.processor.speech_token_index,
+        )  # (1, S_i, H)
+        all_merged.append(merged[0])  # (S_i, H)
+        all_ids.append(input_ids[0])  # (S_i,)
+
+    if verbose:
+        print(f"  Built embeddings in {time.time() - t0:.2f}s")
+
+    # --- Per-sample prefill (builds individual KV caches) ---
+    t0 = time.time()
+    caches = []
+    first_logits = []
+    for i in range(n):
+        cache_i = make_prompt_cache(model.decoder)
+        ids_i = all_ids[i][None, :]  # (1, S_i)
+        emb_i = all_merged[i][None, :]  # (1, S_i, H)
+        logits_i = model.decoder(ids_i, cache=cache_i, input_embeddings=emb_i)
+        mx.eval(logits_i)
+        mx.eval([c.state for c in cache_i])
+        caches.append(cache_i)
+        first_logits.append(logits_i[0, -1, :])  # (vocab,)
+
+    if verbose:
+        print(f"  Prefilled {n} samples in {time.time() - t0:.2f}s")
+
+    # --- Autoregressive generation (per-sample with shared scheduling) ---
+    t0 = time.time()
+    base_sampler = make_sampler(temp=temperature) if temperature > 0 else None
+    blockers = [
+        _wrap_sampler_with_ngram_blocking(base_sampler, NO_REPEAT_NGRAM_SIZE) for _ in range(n)
+    ]
+
+    eos_tokens = {1, 107}
+    if (
+        hasattr(model.processor.tokenizer, "eos_token_id")
+        and model.processor.tokenizer.eos_token_id is not None
+    ):
+        eos_tokens.add(model.processor.tokenizer.eos_token_id)
+
+    generated = [[] for _ in range(n)]
+    finished = [False] * n
+    last_logits = first_logits
+
+    for step in range(max_new_tokens):
+        for i in range(n):
+            if finished[i]:
+                continue
+            token = blockers[i](last_logits[i][None, :])
+            tid = int(token.reshape(-1)[0])
+            if tid in eos_tokens:
+                finished[i] = True
+                continue
+            generated[i].append(tid)
+            input_tok = mx.array([[tid]])
+            logits_i = model.decoder(input_tok, cache=caches[i])
+            mx.eval(logits_i)
+            last_logits[i] = logits_i[0, -1, :]
+
+        if all(finished):
+            break
+
+    gen_time = time.time() - t0
+    results = [model.processor.decode(g) for g in generated]
+
+    if verbose:
+        total_tokens = sum(len(g) for g in generated)
+        tps = total_tokens / gen_time if gen_time > 0 else 0
+        print(f"  Generated {total_tokens} tokens in {gen_time:.2f}s ({tps:.1f} tok/s)")
+
+    return results
 
 
 def _format_time(seconds: float) -> str:
