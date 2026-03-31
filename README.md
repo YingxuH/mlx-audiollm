@@ -87,7 +87,3 @@ Audio (WAV/MP3/FLAC)
       -> Speech embeddings merged into text sequence
         -> Gemma2 Decoder -> text output
 ```
-
-## License
-
-MIT
