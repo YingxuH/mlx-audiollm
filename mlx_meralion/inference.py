@@ -425,6 +425,18 @@ def patch_decoder_for_embeddings(decoder_model):
 
         mask = create_attention_mask(h, cache[0], return_array=True)
 
+        # Gemma2 GQA reshapes scores to 5D (B, n_kv, repeats, L, S).
+        # The mask from BatchKVCache is 4D (B, 1, L, S) which doesn't
+        # broadcast correctly when B>1. Add an extra dim so it becomes
+        # (B, 1, 1, L, S) which broadcasts with any 5D score shape.
+        if (
+            mask is not None
+            and mask.ndim == 4
+            and hasattr(self.args, "num_key_value_heads")
+            and self.args.num_key_value_heads != self.args.num_attention_heads
+        ):
+            mask = mask[:, :, None, :, :]
+
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
@@ -614,16 +626,12 @@ def _infer_segment(
     text_inputs = model.processor.prepare_text(instruction, num_chunks=num_chunks)
     input_ids = mx.array(text_inputs["input_ids"])
 
-    # Encode speech
+    # Encode speech — batch all chunks in one forward pass
     t0 = time.time()
-    chunk_embeds = []
-    for i in range(num_chunks):
-        chunk_mel = mel_mx[i : i + 1]
-        enc_out = model.encoder(chunk_mel)
-        enc_out = model.ln_speech(enc_out)
-        chunk_speech = model.adaptor(enc_out)
-        chunk_embeds.append(chunk_speech)
-    speech_embeds = mx.concatenate(chunk_embeds, axis=1)
+    enc_out = model.encoder(mel_mx)        # (num_chunks, 1500, 1280)
+    enc_out = model.ln_speech(enc_out)     # (num_chunks, 1500, 1280)
+    speech_embeds = model.adaptor(enc_out)  # (num_chunks, 100, H)
+    speech_embeds = speech_embeds.reshape(1, -1, speech_embeds.shape[-1])
     mx.eval(speech_embeds)
     if verbose:
         print(f"  Encoded {num_chunks} chunk(s) in {time.time() - t0:.2f}s")
@@ -768,22 +776,24 @@ def transcribe(
 def _encode_audio(model: LoadedModel, audio_array: np.ndarray, verbose: bool = False):
     """Encode a single audio array through encoder + adaptor.
 
+    All chunks are batched through encoder/ln_speech/adaptor in one forward
+    pass (they share the same mel dimensions since audio is padded to 30s).
+
     Returns speech embeddings ready for merging into text sequence.
     """
     mel_features, num_chunks = model.processor.prepare_audio(
         audio_array=audio_array,
         max_duration=None,
     )
-    mel_mx = mx.array(mel_features)
+    mel_mx = mx.array(mel_features)  # (num_chunks, num_mel_bins, time)
 
-    chunk_embeds = []
-    for i in range(num_chunks):
-        chunk_mel = mel_mx[i : i + 1]
-        enc_out = model.encoder(chunk_mel)
-        enc_out = model.ln_speech(enc_out)
-        chunk_speech = model.adaptor(enc_out)
-        chunk_embeds.append(chunk_speech)
-    speech_embeds = mx.concatenate(chunk_embeds, axis=1)
+    # Batch all chunks through encoder + adaptor in one pass
+    enc_out = model.encoder(mel_mx)        # (num_chunks, 1500, 1280)
+    enc_out = model.ln_speech(enc_out)     # (num_chunks, 1500, 1280)
+    speech_embeds = model.adaptor(enc_out)  # (num_chunks, 100, H)
+
+    # Merge chunks into single sequence: (1, num_chunks*100, H)
+    speech_embeds = speech_embeds.reshape(1, -1, speech_embeds.shape[-1])
     mx.eval(speech_embeds)
     return speech_embeds, num_chunks
 
@@ -869,8 +879,7 @@ def batch_transcribe(
     Returns:
         List of generated text strings, one per audio
     """
-    from mlx_lm import cache as lm_cache
-    from mlx_lm.models.base import create_attention_mask
+    from mlx_lm.models.cache import BatchKVCache
 
     instruction = get_task_prompt(task, **task_kwargs)
     B = len(audios)
@@ -886,14 +895,45 @@ def batch_transcribe(
         else:
             audio_arrays.append(audio)
 
-    # Phase 2: Encode all audio + build merged embeddings (per-item)
+    # Phase 2: Batch-encode all audio chunks through encoder+adaptor, then merge
     t0 = time.time()
-    all_embeds = []  # list of (seq_len_i, H) — no batch dim
-    all_input_ids = []  # list of (seq_len_i,) — no batch dim
+
+    # 2a: Prepare mel features and text inputs for each audio
+    all_mel_chunks = []   # list of (num_chunks_i, mel_bins, time) arrays
+    all_num_chunks = []
+    all_text_inputs = []
     for audio_array in audio_arrays:
-        embeds, ids = _prepare_embeddings(model, audio_array, instruction)
-        all_embeds.append(embeds)
-        all_input_ids.append(ids)
+        mel_features, num_chunks = model.processor.prepare_audio(
+            audio_array=audio_array, max_duration=None,
+        )
+        all_mel_chunks.append(mx.array(mel_features))
+        all_num_chunks.append(num_chunks)
+        text_inputs = model.processor.prepare_text(instruction, num_chunks=num_chunks)
+        all_text_inputs.append(mx.array(text_inputs["input_ids"]))
+
+    # 2b: Stack ALL chunks across all audios into one big batch for encoder
+    all_chunks_flat = mx.concatenate(all_mel_chunks, axis=0)  # (total_chunks, mel, time)
+    enc_out = model.encoder(all_chunks_flat)
+    enc_out = model.ln_speech(enc_out)
+    all_speech_flat = model.adaptor(enc_out)  # (total_chunks, 100, H)
+    mx.eval(all_speech_flat)
+
+    # 2c: Split back per-audio and merge with text embeddings
+    all_embeds = []   # list of (seq_len_i, H) — no batch dim
+    all_input_ids = []  # list of (seq_len_i,) — no batch dim
+    chunk_offset = 0
+    for i in range(B):
+        nc = all_num_chunks[i]
+        speech_embeds = all_speech_flat[chunk_offset : chunk_offset + nc]
+        speech_embeds = speech_embeds.reshape(1, -1, speech_embeds.shape[-1])
+        chunk_offset += nc
+
+        input_ids = all_text_inputs[i]
+        merged = build_merged_embeddings_single(
+            model.decoder, input_ids, speech_embeds, model.processor.speech_token_index,
+        )
+        all_embeds.append(merged[0])       # (seq_len, H)
+        all_input_ids.append(input_ids[0])  # (seq_len,)
 
     if verbose:
         lens = [e.shape[0] for e in all_embeds]
@@ -905,7 +945,7 @@ def batch_transcribe(
     mx.eval(batched_embeds, batched_ids)
 
     # Phase 4: Create batch-aware KV cache (handles left-padding offsets)
-    batch_cache = [lm_cache.BatchKVCache(padding) for _ in model.decoder.model.layers]
+    batch_cache = [BatchKVCache(padding) for _ in model.decoder.model.layers]
 
     # Phase 5: Prefill with embeddings — bakes audio info into KV cache
     t0 = time.time()
@@ -937,8 +977,11 @@ def batch_transcribe(
         print(f"  Prefill done in {time.time() - t0:.2f}s")
 
     # Phase 6: Batched autoregressive decode — token IDs only
+    #
+    # Key optimization: minimize GPU→CPU syncs. Instead of mx.eval every step,
+    # we keep tokens on GPU and only sync every `check_interval` steps to see
+    # if all sequences hit EOS. After generation, we sync once to read all tokens.
     t0 = time.time()
-    sampler = (lambda x: mx.argmax(x, axis=-1))
 
     eos_tokens = {1, 107}
     if (
@@ -947,34 +990,48 @@ def batch_transcribe(
     ):
         eos_tokens.add(model.processor.tokenizer.eos_token_id)
 
-    generated = [[] for _ in range(B)]
-    active = [True] * B
+    # Build EOS token array for GPU-side checking
+    eos_arr = mx.array(sorted(eos_tokens))  # (E,)
+
+    tokens_buf = []      # list of mx.array (B,) — all generated tokens
+    done = mx.zeros((B,), dtype=mx.bool_)  # GPU-side per-sequence done flag
+    check_interval = 8   # sync every N steps
 
     for step in range(max_new_tokens):
-        # Sample next tokens
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        y = sampler(logprobs)  # (B,)
-        mx.eval(y)
+        y = mx.argmax(logits, axis=-1)  # (B,) — greedy, no logprobs needed
+        tokens_buf.append(y)
 
-        # Check EOS per sequence
-        y_list = y.tolist()
-        any_active = False
+        # GPU-side EOS check: is y[i] in eos_tokens?
+        is_eos = mx.any(y[:, None] == eos_arr[None, :], axis=-1)  # (B,)
+        done = done | is_eos
+
+        # Only sync periodically to check if ALL sequences are done
+        if (step + 1) % check_interval == 0:
+            mx.eval(done)
+            if bool(mx.all(done)):
+                break
+
+        # Forward pass with token IDs (KV cache has context)
+        logits = model.decoder(y[:, None], cache=batch_cache)
+        logits = logits[:, -1, :]
+
+    # Sync all tokens at once
+    if tokens_buf:
+        mx.eval(*tokens_buf)
+
+    # Reconstruct per-sequence token lists, truncating at first EOS
+    generated = [[] for _ in range(B)]
+    stopped = [False] * B
+    for y_arr in tokens_buf:
+        y_list = y_arr.tolist()
         for i in range(B):
-            if not active[i]:
+            if stopped[i]:
                 continue
             tid = y_list[i]
             if tid in eos_tokens:
-                active[i] = False
+                stopped[i] = True
             else:
                 generated[i].append(tid)
-                any_active = True
-
-        if not any_active:
-            break
-
-        # Forward pass with just token IDs (KV cache has the context)
-        logits = model.decoder(y[:, None], cache=batch_cache)
-        logits = logits[:, -1, :]
 
     gen_time = time.time() - t0
     results = [model.processor.decode(g) for g in generated]
