@@ -32,54 +32,53 @@ from .whisper_encoder import WhisperEncoder, WhisperEncoderConfig
 from .adaptor import create_adapter
 
 # ---------------------------------------------------------------------------
-# N-gram blocking via logits processor (pure MLX ops, no pipeline break)
+# N-gram blocking (post-generation check, no pipeline break)
 # ---------------------------------------------------------------------------
 
 NO_REPEAT_NGRAM_SIZE = 6
 
 
-def _make_ngram_logits_processor(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
-    """Create a logits processor that bans repeated n-grams using pure MLX ops.
+class NgramBlocker:
+    """Tracks generated n-grams and detects repetition.
 
-    Unlike a Python-side sampler that calls int() on each token (breaking
-    MLX's async GPU pipeline), this processor uses mx.array indexing to
-    set banned token logits to -inf. The banned token list is built from
-    already-materialized token IDs collected outside the hot loop.
+    Applied OUTSIDE the generate_step hot loop — only operates on
+    already-materialized token IDs, so it never breaks MLX's async
+    GPU pipeline.
 
-    Returns (processor_fn, token_collector) where:
-        - processor_fn(logits) -> logits with banned tokens masked
-        - token_collector is a list to append materialized token IDs to
+    When repetition is detected, the generation loop stops early
+    (treating it as EOS). This prevents catastrophic repetition loops
+    while keeping the generation pipeline fast.
     """
-    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
-    id_list: list[int] = []
 
-    def _update_ngrams():
-        """Update n-gram table from the latest token in id_list."""
-        if len(id_list) >= ngram_size:
-            prefix = tuple(id_list[-ngram_size:-1])
-            if prefix not in prefix_to_next:
-                prefix_to_next[prefix] = set()
-            prefix_to_next[prefix].add(id_list[-1])
+    def __init__(self, ngram_size: int = NO_REPEAT_NGRAM_SIZE):
+        self.ngram_size = ngram_size
+        self.prefix_to_next: dict[tuple[int, ...], set[int]] = {}
+        self.id_list: list[int] = []
 
-    def processor(logits: mx.array) -> mx.array:
-        # Update ngram table with any new tokens added to id_list since last call
-        _update_ngrams()
+    def add_and_check(self, token_id: int) -> bool:
+        """Register a token and check if it created a repeated n-gram.
 
-        if len(id_list) < ngram_size - 1:
-            return logits
+        Returns True if the token created a repeated n-gram (caller should
+        remove it and stop generation).
+        """
+        self.id_list.append(token_id)
 
-        ctx = tuple(id_list[-(ngram_size - 1):])
-        banned = prefix_to_next.get(ctx)
-        if not banned:
-            return logits
+        if len(self.id_list) < self.ngram_size:
+            return False
 
-        # Mask banned tokens with -inf using pure MLX ops
-        banned_ids = mx.array(list(banned), dtype=mx.int32)
-        flat = logits.reshape(-1) if logits.ndim == 2 else logits
-        flat = flat.at[banned_ids].add(mx.array(-1e9))
-        return flat.reshape(logits.shape) if logits.ndim == 2 else flat
+        prefix = tuple(self.id_list[-self.ngram_size:-1])
+        last = self.id_list[-1]
 
-    return processor, id_list
+        if prefix in self.prefix_to_next and last in self.prefix_to_next[prefix]:
+            # This token completed a repeated n-gram — signal to stop
+            self.id_list.pop()
+            return True
+
+        # Record this n-gram
+        if prefix not in self.prefix_to_next:
+            self.prefix_to_next[prefix] = set()
+        self.prefix_to_next[prefix].add(last)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -526,20 +525,12 @@ def _infer_segment(
     )
     mx.eval(merged_embeds)
 
-    # Generate with n-gram blocking via logits processor (pure MLX ops)
+    # Generate — n-gram blocking applied post-hoc (no pipeline break)
     prompt_tokens = input_ids[0]
     embeddings_2d = merged_embeds[0]
 
-    ngram_processor, ngram_ids = _make_ngram_logits_processor(NO_REPEAT_NGRAM_SIZE)
-    base_sampler = make_sampler(temp=temperature) if temperature > 0 else None
-
-    def sampler_with_ngram(logits: mx.array) -> mx.array:
-        logits = ngram_processor(logits)
-        if base_sampler is not None:
-            return base_sampler(logits)
-        return mx.argmax(logits, axis=-1)
-
-    sampler = sampler_with_ngram
+    sampler = make_sampler(temp=temperature) if temperature > 0 else None
+    blocker = NgramBlocker(NO_REPEAT_NGRAM_SIZE)
 
     eos_tokens = {1, 107}
     if (
@@ -559,10 +550,10 @@ def _infer_segment(
         token_id = token.item() if hasattr(token, "item") else int(token)
         if token_id in eos_tokens:
             break
+        # N-gram check on already-materialized token (no pipeline break)
+        if blocker.add_and_check(token_id):
+            break
         generated_tokens.append(token_id)
-        # Feed materialized token back for n-gram tracking (no pipeline break
-        # since mx.eval already happened before yield)
-        ngram_ids.append(token_id)
 
     gen_time = time.time() - t0
     response = model.processor.decode(generated_tokens)
