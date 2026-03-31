@@ -1,67 +1,78 @@
-"""Tests for inference module (n-gram blocking, utilities)."""
+"""Tests for inference module (n-gram sampler, utilities)."""
+
+import mlx.core as mx
 
 from mlx_meralion.inference import (
     NO_REPEAT_NGRAM_SIZE,
-    NgramBlocker,
     is_converted_dir,
     is_raw_hf_dir,
+    make_no_repeat_ngram_sampler,
 )
 
 
-class TestNgramBlocker:
-    """Tests for NgramBlocker."""
+class TestNoRepeatNgramSampler:
+    """Tests for make_no_repeat_ngram_sampler()."""
 
     def test_default_ngram_size(self):
         assert NO_REPEAT_NGRAM_SIZE == 6
 
-    def test_no_repeat_initially(self):
-        blocker = NgramBlocker(3)
-        assert blocker.add_and_check(5) is False
-        assert blocker.add_and_check(5) is False
+    def test_sampler_returns_token(self):
+        sampler = make_no_repeat_ngram_sampler(3)
+        logits = mx.array([0.1, 0.5, 0.3, 0.8, 0.2])
+        token = sampler(logits)
+        mx.eval(token)
+        assert int(token) == 3  # argmax
 
-    def test_detects_repeated_trigram(self):
-        blocker = NgramBlocker(3)
-        # Generate [1, 2, 3] — records trigram (1,2)->3
-        for t in [1, 2, 3]:
-            assert blocker.add_and_check(t) is False
-        # Generate [1, 2] again — no repeat yet
-        assert blocker.add_and_check(1) is False
-        assert blocker.add_and_check(2) is False
-        # Next token 3 would complete repeat of (1,2)->3
-        assert blocker.add_and_check(3) is True
+    def test_sampler_blocks_repeated_ngram(self):
+        sampler = make_no_repeat_ngram_sampler(3)
+        logits = mx.zeros(10)
+        logits_with_5 = logits.at[5].add(10.0)
 
-    def test_same_token_repeat(self):
-        blocker = NgramBlocker(3)
-        # [5, 5, 5] — records (5,5)->5
-        assert blocker.add_and_check(5) is False
-        assert blocker.add_and_check(5) is False
-        assert blocker.add_and_check(5) is False
-        # 4th 5: context is (5,5) and 5 is banned
-        assert blocker.add_and_check(5) is True
+        # Generate [5, 5, 5] — records trigram (5,5)->5
+        for _ in range(3):
+            sampler(logits_with_5)
 
-    def test_different_context_allowed(self):
-        blocker = NgramBlocker(3)
-        for t in [1, 2, 3]:
-            blocker.add_and_check(t)
-        # Context (2,3), next=4 is fine
-        assert blocker.add_and_check(4) is False
+        # Next: context is (5,5), token 5 should be banned
+        token = sampler(logits_with_5)
+        mx.eval(token)
+        assert int(token) != 5
 
-    def test_ngram_size_2(self):
-        blocker = NgramBlocker(2)
-        assert blocker.add_and_check(5) is False
-        assert blocker.add_and_check(7) is False  # records (5)->7
-        assert blocker.add_and_check(5) is False  # records (7)->5
-        assert blocker.add_and_check(7) is True   # (5)->7 already seen
+    def test_sampler_allows_different_context(self):
+        sampler = make_no_repeat_ngram_sampler(3)
+        logits_5 = mx.zeros(10).at[5].add(10.0)
+        for _ in range(3):
+            sampler(logits_5)
 
-    def test_popped_token_not_in_list(self):
-        blocker = NgramBlocker(2)
-        blocker.add_and_check(1)
-        blocker.add_and_check(2)  # records (1)->2
-        blocker.add_and_check(1)  # records (2)->1
-        # (1)->2 is banned
-        assert blocker.add_and_check(2) is True
-        # Token 2 should NOT be in id_list (it was popped)
-        assert blocker.id_list == [1, 2, 1]
+        # Add token 3 to change context
+        logits_3 = mx.zeros(10).at[3].add(10.0)
+        token = sampler(logits_3)
+        mx.eval(token)
+        assert int(token) == 3
+
+        # Context is now (5,3), so 5 should be allowed
+        token = sampler(logits_5)
+        mx.eval(token)
+        assert int(token) == 5
+
+    def test_sampler_2d_logits(self):
+        sampler = make_no_repeat_ngram_sampler(3)
+        logits = mx.array([[0.1, 0.5, 0.3, 0.8, 0.2]])
+        token = sampler(logits)
+        mx.eval(token)
+        assert int(token) == 3
+
+    def test_repeated_sequence_blocked(self):
+        sampler = make_no_repeat_ngram_sampler(3)
+        # Generate [1, 2, 3, 1, 2] — records (1,2)->3
+        tokens = [1, 2, 3, 1, 2]
+        for t in tokens:
+            logits = mx.zeros(10).at[t].add(10.0)
+            sampler(logits)
+        # Next: context is (1,2), token 3 is banned
+        logits = mx.zeros(10).at[3].add(10.0)
+        token = sampler(logits)
+        mx.eval(token)
+        assert int(token) != 3
 
 
 class TestDirectoryDetection:

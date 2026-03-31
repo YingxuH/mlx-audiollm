@@ -32,53 +32,58 @@ from .whisper_encoder import WhisperEncoder, WhisperEncoderConfig
 from .adaptor import create_adapter
 
 # ---------------------------------------------------------------------------
-# N-gram blocking (post-generation check, no pipeline break)
+# N-gram blocking sampler
 # ---------------------------------------------------------------------------
 
 NO_REPEAT_NGRAM_SIZE = 6
 
 
-class NgramBlocker:
-    """Tracks generated n-grams and detects repetition.
+def make_no_repeat_ngram_sampler(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
+    """Create a greedy sampler that blocks repeated n-grams.
 
-    Applied OUTSIDE the generate_step hot loop — only operates on
-    already-materialized token IDs, so it never breaks MLX's async
-    GPU pipeline.
+    Tracks generated n-grams and falls back to the next-best token when
+    the greedy choice would create a repeated n-gram. This matches the
+    behavior of HuggingFace's no_repeat_ngram_size in generation_config.json.
 
-    When repetition is detected, the generation loop stops early
-    (treating it as EOS). This prevents catastrophic repetition loops
-    while keeping the generation pipeline fast.
+    Note: calls int() per token which forces synchronous evaluation.
+    This is acceptable because mlx-lm's generate_step already calls
+    y.item() before yield, so the token is already materialized.
+    Requires sufficient GPU memory to avoid thrashing.
+
+    Returns a sampler compatible with mlx-lm's generate_step(sampler=...).
     """
+    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
+    id_list: list[int] = []
 
-    def __init__(self, ngram_size: int = NO_REPEAT_NGRAM_SIZE):
-        self.ngram_size = ngram_size
-        self.prefix_to_next: dict[tuple[int, ...], set[int]] = {}
-        self.id_list: list[int] = []
+    def _register(token: int):
+        id_list.append(token)
+        if len(id_list) >= ngram_size:
+            prefix = tuple(id_list[-ngram_size:-1])
+            if prefix not in prefix_to_next:
+                prefix_to_next[prefix] = set()
+            prefix_to_next[prefix].add(id_list[-1])
 
-    def add_and_check(self, token_id: int) -> bool:
-        """Register a token and check if it created a repeated n-gram.
+    def sampler(logits: mx.array) -> mx.array:
+        flat = logits.reshape(-1) if logits.ndim == 2 else logits
+        token = mx.argmax(flat)
+        tid = int(token)
 
-        Returns True if the token created a repeated n-gram (caller should
-        remove it and stop generation).
-        """
-        self.id_list.append(token_id)
+        if len(id_list) >= ngram_size - 1:
+            ctx = tuple(id_list[-(ngram_size - 1):])
+            banned = prefix_to_next.get(ctx)
+            if banned and tid in banned:
+                sorted_ids = mx.argsort(flat)[::-1]
+                for candidate in sorted_ids:
+                    cid = int(candidate)
+                    if cid not in banned:
+                        tid = cid
+                        token = candidate
+                        break
 
-        if len(self.id_list) < self.ngram_size:
-            return False
+        _register(tid)
+        return token.reshape(logits.shape[:-1]) if logits.ndim == 2 else token
 
-        prefix = tuple(self.id_list[-self.ngram_size:-1])
-        last = self.id_list[-1]
-
-        if prefix in self.prefix_to_next and last in self.prefix_to_next[prefix]:
-            # This token completed a repeated n-gram — signal to stop
-            self.id_list.pop()
-            return True
-
-        # Record this n-gram
-        if prefix not in self.prefix_to_next:
-            self.prefix_to_next[prefix] = set()
-        self.prefix_to_next[prefix].add(last)
-        return False
+    return sampler
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +491,6 @@ def _infer_segment(
     generation_config.json and prevent repetitive output.
     """
     from mlx_lm.generate import generate_step
-    from mlx_lm.sample_utils import make_sampler
 
     # Prepare audio (chunked into 30s pieces internally)
     mel_features, num_chunks = model.processor.prepare_audio(
@@ -525,12 +529,11 @@ def _infer_segment(
     )
     mx.eval(merged_embeds)
 
-    # Generate — n-gram blocking applied post-hoc (no pipeline break)
+    # Generate with n-gram blocking sampler
     prompt_tokens = input_ids[0]
     embeddings_2d = merged_embeds[0]
 
-    sampler = make_sampler(temp=temperature) if temperature > 0 else None
-    blocker = NgramBlocker(NO_REPEAT_NGRAM_SIZE)
+    sampler = make_no_repeat_ngram_sampler(NO_REPEAT_NGRAM_SIZE)
 
     eos_tokens = {1, 107}
     if (
@@ -549,9 +552,6 @@ def _infer_segment(
     ):
         token_id = token.item() if hasattr(token, "item") else int(token)
         if token_id in eos_tokens:
-            break
-        # N-gram check on already-materialized token (no pipeline break)
-        if blocker.add_and_check(token_id):
             break
         generated_tokens.append(token_id)
 
