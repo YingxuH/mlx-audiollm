@@ -1,28 +1,37 @@
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - "v*"
-
-permissions:
-  id-token: write
+  workflow_dispatch:
 
 jobs:
-  publish:
+  build-and-publish:
     runs-on: ubuntu-latest
-    environment: pypi
-    steps:
-      - uses: actions/checkout@v4
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build package
-        run: |
-          pip install build
-          python -m build
+      - name: Install tools
+        run: pip install build
 
-      - name: Publish to PyPI
+      - name: Build the package
+        run: python -m build
+
+      - name: Generate SLSA provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "dist/*"
+
+      - name: Upload to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

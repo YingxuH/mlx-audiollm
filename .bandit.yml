@@ -1,0 +1,3 @@
+skips:
+  - B105  # hardcoded_password_string - false positive on speech token constant
+  - B615  # huggingface_unsafe_download - intentionally downloading latest model
