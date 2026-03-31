@@ -41,9 +41,14 @@ NO_REPEAT_NGRAM_SIZE = 6
 def make_no_repeat_ngram_sampler(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
     """Create a greedy sampler that blocks repeated n-grams.
 
-    Instead of modifying logits (which breaks MLX's async GPU pipeline),
-    this sampler does greedy argmax and falls back to the next-best token
-    if the top choice would create a repeated n-gram.
+    Tracks generated n-grams and falls back to the next-best token when
+    the greedy choice would create a repeated n-gram. This matches the
+    behavior of HuggingFace's no_repeat_ngram_size in generation_config.json.
+
+    Note: calls int() per token which forces synchronous evaluation.
+    This is acceptable because mlx-lm's generate_step already calls
+    y.item() before yield, so the token is already materialized.
+    Requires sufficient GPU memory to avoid thrashing.
 
     Returns a sampler compatible with mlx-lm's generate_step(sampler=...).
     """
@@ -60,11 +65,9 @@ def make_no_repeat_ngram_sampler(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
 
     def sampler(logits: mx.array) -> mx.array:
         flat = logits.reshape(-1) if logits.ndim == 2 else logits
-
         token = mx.argmax(flat)
         tid = int(token)
 
-        # Check if this token creates a banned ngram
         if len(id_list) >= ngram_size - 1:
             ctx = tuple(id_list[-(ngram_size - 1) :])
             banned = prefix_to_next.get(ctx)
@@ -86,13 +89,15 @@ def make_no_repeat_ngram_sampler(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
 def _wrap_sampler_with_ngram_blocking(base_sampler, ngram_size: int = NO_REPEAT_NGRAM_SIZE):
     """Wrap any sampler (including temperature>0) with n-gram blocking.
 
-    For temperature=0 (base_sampler is None), uses greedy with blocking.
-    For temperature>0, runs the base sampler then checks/rejects banned n-grams.
+    Runs the base sampler first, then checks if the chosen token would
+    create a repeated n-gram. If so, falls back to the next-best token
+    by logit ranking (ignoring the base sampler's stochastic choice).
+
+    For temperature=0 (base_sampler is None), uses the greedy n-gram sampler.
     """
     if base_sampler is None:
         return make_no_repeat_ngram_sampler(ngram_size)
 
-    # Wrap the existing sampler
     prefix_to_next: dict[tuple[int, ...], set[int]] = {}
     id_list: list[int] = []
 
@@ -532,7 +537,6 @@ def _infer_segment(
     generation_config.json and prevent repetitive output.
     """
     from mlx_lm.generate import generate_step
-    from mlx_lm.sample_utils import make_sampler
 
     # Prepare audio (chunked into 30s pieces internally)
     mel_features, num_chunks = model.processor.prepare_audio(
@@ -571,7 +575,9 @@ def _infer_segment(
     )
     mx.eval(merged_embeds)
 
-    # Generate with n-gram blocking always enabled
+    # Generate with n-gram blocking always enabled (greedy and sampling)
+    from mlx_lm.sample_utils import make_sampler
+
     prompt_tokens = input_ids[0]
     embeddings_2d = merged_embeds[0]
 
