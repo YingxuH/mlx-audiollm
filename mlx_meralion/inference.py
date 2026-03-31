@@ -491,9 +491,7 @@ def build_merged_embeddings(
         # Replace text embeddings at speech positions with speech embeddings
         for i in range(n_pos):
             pos = int(speech_positions[i])
-            text_embeds = text_embeds.at[b, pos].add(
-                speech_embeds[b, i] - text_embeds[b, pos]
-            )
+            text_embeds = text_embeds.at[b, pos].add(speech_embeds[b, i] - text_embeds[b, pos])
 
     return text_embeds
 
@@ -537,9 +535,7 @@ def build_merged_embeddings_single(
 
     for i in range(n_pos):
         pos = int(speech_positions[i])
-        text_embeds = text_embeds.at[0, pos].add(
-            speech_embeds[0, i] - text_embeds[0, pos]
-        )
+        text_embeds = text_embeds.at[0, pos].add(speech_embeds[0, i] - text_embeds[0, pos])
 
     return text_embeds
 
@@ -628,8 +624,8 @@ def _infer_segment(
 
     # Encode speech — batch all chunks in one forward pass
     t0 = time.time()
-    enc_out = model.encoder(mel_mx)        # (num_chunks, 1500, 1280)
-    enc_out = model.ln_speech(enc_out)     # (num_chunks, 1500, 1280)
+    enc_out = model.encoder(mel_mx)  # (num_chunks, 1500, 1280)
+    enc_out = model.ln_speech(enc_out)  # (num_chunks, 1500, 1280)
     speech_embeds = model.adaptor(enc_out)  # (num_chunks, 100, H)
     speech_embeds = speech_embeds.reshape(1, -1, speech_embeds.shape[-1])
     mx.eval(speech_embeds)
@@ -788,8 +784,8 @@ def _encode_audio(model: LoadedModel, audio_array: np.ndarray, verbose: bool = F
     mel_mx = mx.array(mel_features)  # (num_chunks, num_mel_bins, time)
 
     # Batch all chunks through encoder + adaptor in one pass
-    enc_out = model.encoder(mel_mx)        # (num_chunks, 1500, 1280)
-    enc_out = model.ln_speech(enc_out)     # (num_chunks, 1500, 1280)
+    enc_out = model.encoder(mel_mx)  # (num_chunks, 1500, 1280)
+    enc_out = model.ln_speech(enc_out)  # (num_chunks, 1500, 1280)
     speech_embeds = model.adaptor(enc_out)  # (num_chunks, 100, H)
 
     # Merge chunks into single sequence: (1, num_chunks*100, H)
@@ -833,7 +829,7 @@ def _left_pad_embeddings(embeds_list: list[mx.array]) -> tuple[mx.array, list[in
     lengths = [e.shape[0] for e in embeds_list]
     max_len = max(lengths)
     H = embeds_list[0].shape[-1]
-    padding = [max_len - l for l in lengths]
+    padding = [max_len - seq_len for seq_len in lengths]
 
     padded = []
     for embed, pad in zip(embeds_list, padding):
@@ -899,12 +895,13 @@ def batch_transcribe(
     t0 = time.time()
 
     # 2a: Prepare mel features and text inputs for each audio
-    all_mel_chunks = []   # list of (num_chunks_i, mel_bins, time) arrays
+    all_mel_chunks = []  # list of (num_chunks_i, mel_bins, time) arrays
     all_num_chunks = []
     all_text_inputs = []
     for audio_array in audio_arrays:
         mel_features, num_chunks = model.processor.prepare_audio(
-            audio_array=audio_array, max_duration=None,
+            audio_array=audio_array,
+            max_duration=None,
         )
         all_mel_chunks.append(mx.array(mel_features))
         all_num_chunks.append(num_chunks)
@@ -919,7 +916,7 @@ def batch_transcribe(
     mx.eval(all_speech_flat)
 
     # 2c: Split back per-audio and merge with text embeddings
-    all_embeds = []   # list of (seq_len_i, H) — no batch dim
+    all_embeds = []  # list of (seq_len_i, H) — no batch dim
     all_input_ids = []  # list of (seq_len_i,) — no batch dim
     chunk_offset = 0
     for i in range(B):
@@ -930,9 +927,12 @@ def batch_transcribe(
 
         input_ids = all_text_inputs[i]
         merged = build_merged_embeddings_single(
-            model.decoder, input_ids, speech_embeds, model.processor.speech_token_index,
+            model.decoder,
+            input_ids,
+            speech_embeds,
+            model.processor.speech_token_index,
         )
-        all_embeds.append(merged[0])       # (seq_len, H)
+        all_embeds.append(merged[0])  # (seq_len, H)
         all_input_ids.append(input_ids[0])  # (seq_len,)
 
     if verbose:
@@ -993,9 +993,9 @@ def batch_transcribe(
     # Build EOS token array for GPU-side checking
     eos_arr = mx.array(sorted(eos_tokens))  # (E,)
 
-    tokens_buf = []      # list of mx.array (B,) — all generated tokens
+    tokens_buf = []  # list of mx.array (B,) — all generated tokens
     done = mx.zeros((B,), dtype=mx.bool_)  # GPU-side per-sequence done flag
-    check_interval = 8   # sync every N steps
+    check_interval = 8  # sync every N steps
 
     for step in range(max_new_tokens):
         y = mx.argmax(logits, axis=-1)  # (B,) — greedy, no logprobs needed

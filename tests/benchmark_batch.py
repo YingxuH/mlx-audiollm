@@ -56,6 +56,7 @@ def load_wav_as_float32(wav_path: str) -> np.ndarray:
     """Load a 16-bit WAV file as float32 array."""
     from scipy.io import wavfile
     import warnings
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         sr, data = wavfile.read(wav_path)
@@ -102,7 +103,7 @@ def prepare_audios(num_audios: int, audio_dir: str | None = None) -> list[np.nda
         durations = [len(a) / 16000 for a in audios]
         print(f"  Durations: {[f'{d:.1f}s' for d in durations]}")
     else:
-        print(f"macOS TTS not available, using synthetic sine waves (limited decode output)")
+        print("macOS TTS not available, using synthetic sine waves (limited decode output)")
         freqs = [220 + i * 110 for i in range(num_audios)]
         audios = [generate_synthetic_audio(5.0, freq=f) for f in freqs]
         print(f"  Generated {num_audios} sine waves @ {freqs[:5]}{'...' if len(freqs) > 5 else ''}")
@@ -161,6 +162,7 @@ def benchmark(
     # Warmup
     print("Warming up (1 inference)...")
     from mlx_meralion import transcribe
+
     warmup_text = transcribe(model, audios[0], task="asr", max_new_tokens=16, verbose=False)
     print(f"  Warmup output: {warmup_text[:100]}")
     print("Warmup done.\n")
@@ -191,7 +193,9 @@ def benchmark(
     print("=" * 78)
     print(f"{'Method':<25} {'B':>3} {'Time(s)':>8} {'Aud/s':>7} {'Speedup':>8}  Correct?")
     print("=" * 78)
-    print(f"{'Sequential (for-loop)':<25} {n_seq:>3} {seq_time:>8.2f} {seq_throughput:>7.2f} {'1.00x':>8}  ---")
+    print(
+        f"{'Sequential (for-loop)':<25} {n_seq:>3} {seq_time:>8.2f} {seq_throughput:>7.2f} {'1.00x':>8}  ---"
+    )
 
     all_correct = True
     for bs in batch_sizes:
@@ -213,12 +217,14 @@ def benchmark(
         if not correct:
             all_correct = False
 
-        print(f"{'batch_transcribe':<25} {bs:>3} {batch_time:>8.2f} {batch_throughput:>7.2f} {speedup:>7.2f}x  {status}")
+        print(
+            f"{'batch_transcribe':<25} {bs:>3} {batch_time:>8.2f} {batch_throughput:>7.2f} {speedup:>7.2f}x  {status}"
+        )
 
     print("=" * 78)
 
     # --- Output samples ---
-    print(f"\nSample outputs (first 200 chars):")
+    print("\nSample outputs (first 200 chars):")
     for i in range(min(3, n_seq)):
         print(f"  [{i}] seq:   {seq_results[i][:200]}")
     # Reuse last batch results for display

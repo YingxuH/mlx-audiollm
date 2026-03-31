@@ -330,7 +330,7 @@ class TestBatchDecodeIsTrulyBatched:
 
         from mlx_lm.models.cache import BatchKVCache
 
-        B, S, H, V = 3, 4, 16, 32
+        B, S, H = 3, 4, 16
         decoder = _MockDecoder()
 
         # Simulate batch prefill + decode (simplified version of batch_transcribe)
@@ -354,8 +354,7 @@ class TestBatchDecodeIsTrulyBatched:
         assert call_shapes[0] == ("fwd", (B, S, H)), f"Prefill shape wrong: {call_shapes[0]}"
         for i, shape in enumerate(call_shapes[1:], 1):
             assert shape == ("fwd", (B, 1, H)), (
-                f"Decode step {i} shape {shape} != (B=3, 1, H=16) — "
-                f"NOT truly batched!"
+                f"Decode step {i} shape {shape} != (B=3, 1, H=16) — NOT truly batched!"
             )
 
     def test_sequential_would_show_batch_1(self):
