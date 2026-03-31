@@ -34,9 +34,6 @@ text = transcribe(model, "audio.wav", task="translate_zh")
 
 # Spoken question answering
 text = transcribe(model, "audio.wav", task="sqa", question="What is the speaker talking about?")
-
-# Summarize dialogue
-text = transcribe(model, "audio.wav", task="summarize")
 ```
 
 ### Batch Inference
@@ -56,14 +53,8 @@ for text in results:
 ### CLI
 
 ```bash
-# ASR (default task)
 mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --task asr
-
-# Translation
 mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --task translate_zh
-
-# Custom instruction
-mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --instruction "Summarize this in one sentence."
 ```
 
 ## Supported Tasks
@@ -88,7 +79,7 @@ mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --instruction
 
 ## Batch Inference Benchmark
 
-Measured on Apple M4 Max with MERaLiON-2-10B-MLX, 8 TTS-generated audio samples (~25s each), max 256 tokens:
+Measured on Apple M4 Pro (24 GB) with MERaLiON-2-10B-MLX, 8 audio samples (~25s each), max 256 tokens. Correctness validated by comparing batch outputs against sequential outputs token-for-token.
 
 | Method | B | Time | Throughput | Speedup | Correct |
 |--------|---|------|------------|---------|---------|
@@ -96,18 +87,13 @@ Measured on Apple M4 Max with MERaLiON-2-10B-MLX, 8 TTS-generated audio samples 
 | `batch_transcribe` | 4 | 13.93s | 0.29 aud/s | 1.40x | PASS |
 | `batch_transcribe` | 8 | 23.25s | 0.34 aud/s | 1.68x | PASS |
 
-Correctness is validated by comparing batch outputs against sequential outputs token-for-token. The benchmark script (`tests/benchmark_batch.py`) exits with a non-zero code if any mismatch is detected.
-
-The decoder-only speedup is ~2.2x at B=4. Overall speedup is bounded by the Whisper encoder, which is compute-bound and does not benefit from batching (Amdahl's law). Larger batch sizes and longer generated sequences yield higher speedup.
-
 ## Features
 
 - **Apple Silicon native**: Runs entirely on MLX with GPU acceleration
-- **Batch inference**: GPU-batched decoding via `BatchKVCache` with left-padding alignment
-- **N-gram blocking**: Automatically prevents repetitive output (matching HuggingFace quality)
+- **Batch inference**: GPU-batched decoding via `BatchKVCache` for multi-audio throughput
+- **N-gram blocking**: Prevents repetitive output (matching HuggingFace quality)
 - **Smart chunking**: Long audio split at 30s boundaries; short tails merged to prevent hallucination
-- **Auto-download**: HuggingFace models are downloaded and cached automatically
-- **Multiple tasks**: ASR, translation, QA, summarization, and more
+- **Auto-download**: Models downloaded and cached from HuggingFace automatically
 
 ## Architecture
 
@@ -117,16 +103,4 @@ Audio (WAV/MP3/FLAC)
     -> LayerNorm + MLP Adaptor
       -> Speech embeddings merged into text sequence
         -> Gemma2 Decoder -> text output
-```
-
-### Batch Inference Pipeline
-
-```
-Multiple audios
-  -> Mel features extracted per audio
-    -> All chunks batched through Whisper encoder in one forward pass
-      -> Per-audio embedding merge (speech + text tokens)
-        -> Left-pad to uniform length
-          -> BatchKVCache prefill (embeddings baked into KV cache)
-            -> GPU-batched autoregressive decode (token IDs only)
 ```
