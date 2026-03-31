@@ -69,7 +69,7 @@ def make_no_repeat_ngram_sampler(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
         tid = int(token)
 
         if len(id_list) >= ngram_size - 1:
-            ctx = tuple(id_list[-(ngram_size - 1):])
+            ctx = tuple(id_list[-(ngram_size - 1) :])
             banned = prefix_to_next.get(ctx)
             if banned and tid in banned:
                 sorted_ids = mx.argsort(flat)[::-1]
@@ -114,7 +114,7 @@ def _wrap_sampler_with_ngram_blocking(base_sampler, ngram_size: int = NO_REPEAT_
         tid = int(token.reshape(-1)[0]) if token.ndim > 0 else int(token)
 
         if len(id_list) >= ngram_size - 1:
-            ctx = tuple(id_list[-(ngram_size - 1):])
+            ctx = tuple(id_list[-(ngram_size - 1) :])
             banned = prefix_to_next.get(ctx)
             if banned and tid in banned:
                 flat = logits.reshape(-1) if logits.ndim == 2 else logits
