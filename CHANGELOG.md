@@ -1,7 +1,7 @@
 # CHANGELOG
 
 
-## v0.1.0 (2026-03-31)
+## v0.2.0 (2026-04-01)
 
 ### Bug Fixes
 
@@ -55,6 +55,14 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 
 ### Chores
 
+- Bump version to 0.1.1, fix tag history
+  ([`e43d1c7`](https://github.com/YingxuH/mlx-audiollm/commit/e43d1c7cc342f0d94cb3e6cc30e123127d78216d))
+
+- Restore v0.1.0 tag on original release commit (722d15c) - Bump pyproject.toml and __init__.py to
+  0.1.1 - Restructure CHANGELOG: v0.1.0 = initial release, v0.1.1 = n-gram fix + CI
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
 - Remove MIT license, delete v0.1.0 tag
   ([`6dfc4a4`](https://github.com/YingxuH/mlx-audiollm/commit/6dfc4a4135c4d06af423e7937943f411e9458a8d))
 
@@ -87,19 +95,43 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 
+- Fix benchmark hardware info and trim README for release
+  ([`f58c9f9`](https://github.com/YingxuH/mlx-audiollm/commit/f58c9f9b0ac82614ef41731d87f8548fb8a8a7d4))
+
+- Update README with batch inference API and benchmark results
+  ([`ff55a59`](https://github.com/YingxuH/mlx-audiollm/commit/ff55a5944d20d312b38a7e218669976e130c5eeb))
+
+Also fix ruff lint/format issues across all files to pass CI.
+
 ### Features
 
-- Initial release of mlx-meralion inference package
-  ([`722d15c`](https://github.com/YingxuH/mlx-audiollm/commit/722d15cd38306d5695e90cd697ca90acdb4d9d11))
+- Implement real batch inference with BatchKVCache
+  ([`7023864`](https://github.com/YingxuH/mlx-audiollm/commit/7023864db91136c2cd56507eabef3d1eecdd0bb1))
 
-MLX-native inference for MERaLiON AudioLLM on Apple Silicon.
+- Add batch_transcribe() using mlx-vlm's prefill-then-decode pattern: prefill with input_embeddings
+  to bake multimodal info into KV cache, then decode with token IDs only via BatchKVCache -
+  Vectorize build_merged_embeddings() using mx.where + mx.sort instead of Python double-loop over
+  batch × sequence positions - Add build_merged_embeddings_single() optimized for single-sequence -
+  Add left-padding utilities (_left_pad_embeddings, _left_pad_ids) for uniform batch tensor
+  construction - Add helper functions _encode_audio() and _prepare_embeddings() to modularize the
+  audio-to-embedding pipeline - Export batch_transcribe in __init__.py public API - Add 12 new tests
+  covering embedding merge, single-sequence path, and directory detection (65 total tests passing)
 
-- Whisper encoder + MLP adaptor + Gemma2 decoder pipeline - N-gram blocking always enabled (matches
-  HF generation_config) - Smart chunking for long audio (30s splits, short tail merging) -
-  Auto-download from HuggingFace repos via load_model(repo_id) - High-level API: load_model() +
-  transcribe() - CLI: mlx-meralion --model <repo> --audio <file> --task asr
+- Optimize batch inference with encoder batching, GQA fix, and reduced GPU sync
+  ([`df254f7`](https://github.com/YingxuH/mlx-audiollm/commit/df254f79f9a6bf92cfe5b953549b51265bba6a09))
 
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Key optimizations: - Batch all audio chunks through encoder/ln_speech/adaptor in single forward pass
+  (both per-audio in _encode_audio/_infer_segment and cross-audio in batch_transcribe) - Fix Gemma2
+  GQA 5D mask broadcasting issue for B>1 (4D→5D mask expansion) - Replace per-step mx.eval with
+  GPU-side EOS checking and periodic sync (every 8 steps) - Fix BatchKVCache import path
+  (mlx_lm.models.cache instead of mlx_lm.cache)
+
+Benchmark (MERaLiON-2-10B-MLX, ~25s TTS audio, max_tokens=256): Sequential (8 audios): 38.96s, 0.21
+  audios/s Batch B=4: 13.93s, 0.29 audios/s (1.40x speedup) Batch B=8: 23.25s, 0.34 audios/s (1.68x
+  speedup) Decode-only speedup: ~2.2x at B=4 (Amdahl's law limits overall due to encoder)
+  Correctness: all PASS (batch outputs match sequential exactly)
+
+Tests: 25 tests passing including batch decode shape verification
 
 ### Testing
 
@@ -111,5 +143,22 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
   blocking, wrap sampler, dir detection (13 tests) - test_model: weight partitioning, key remapping,
   config loading (13 tests) - test_processor: task prompts, constants, error handling (11 tests) -
   conftest: shared fixtures for dummy audio data
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+
+## v0.1.0 (2026-03-31)
+
+### Features
+
+- Initial release of mlx-meralion inference package
+  ([`722d15c`](https://github.com/YingxuH/mlx-audiollm/commit/722d15cd38306d5695e90cd697ca90acdb4d9d11))
+
+MLX-native inference for MERaLiON AudioLLM on Apple Silicon.
+
+- Whisper encoder + MLP adaptor + Gemma2 decoder pipeline - N-gram blocking always enabled (matches
+  HF generation_config) - Smart chunking for long audio (30s splits, short tail merging) -
+  Auto-download from HuggingFace repos via load_model(repo_id) - High-level API: load_model() +
+  transcribe() - CLI: mlx-meralion --model <repo> --audio <file> --task asr
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
