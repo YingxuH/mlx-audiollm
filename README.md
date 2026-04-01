@@ -1,6 +1,11 @@
 # mlx-meralion
 
-[![CI](https://github.com/SiruiHe/mlx-audiollm/actions/workflows/ci.yml/badge.svg)](https://github.com/SiruiHe/mlx-audiollm/actions/workflows/ci.yml)
+[![CI](https://github.com/YingxuH/mlx-audiollm/actions/workflows/ci.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/ci.yml)
+[![Security (Bandit)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/security.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/security.yml)
+[![Dependency Audit (pip-audit)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-audit.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-audit.yml)
+[![Dependency Review](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-review.yml)
+[![CodeQL](https://github.com/YingxuH/mlx-audiollm/actions/workflows/codeql.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/codeql.yml)
+[![Publish](https://github.com/YingxuH/mlx-audiollm/actions/workflows/publish.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/publish.yml)
 
 MLX-native inference for [MERaLiON AudioLLM](https://huggingface.co/MERaLiON) on Apple Silicon.
 
