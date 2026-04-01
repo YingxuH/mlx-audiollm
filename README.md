@@ -1,15 +1,10 @@
 # mlx-meralion
 
-[![CI](https://github.com/YingxuH/mlx-audiollm/actions/workflows/ci.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/ci.yml)
-[![Security (Bandit)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/security.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/security.yml)
-[![Dependency Audit (pip-audit)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-audit.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-audit.yml)
-[![Dependency Review](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/dependency-review.yml)
-[![CodeQL](https://github.com/YingxuH/mlx-audiollm/actions/workflows/codeql.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/codeql.yml)
-[![Publish](https://github.com/YingxuH/mlx-audiollm/actions/workflows/publish.yml/badge.svg)](https://github.com/YingxuH/mlx-audiollm/actions/workflows/publish.yml)
+[![CI](https://github.com/SiruiHe/mlx-audiollm/actions/workflows/ci.yml/badge.svg)](https://github.com/SiruiHe/mlx-audiollm/actions/workflows/ci.yml)
 
 MLX-native inference for [MERaLiON AudioLLM](https://huggingface.co/MERaLiON) on Apple Silicon.
 
-MERaLiON is A*STAR's multimodal audio-language model for speech transcription, translation, spoken question answering, and more.
+MERaLiON is A\*STAR's multimodal audio-language model for speech transcription, translation, spoken question answering, and more.
 
 ## Installation
 
@@ -39,22 +34,27 @@ text = transcribe(model, "audio.wav", task="translate_zh")
 
 # Spoken question answering
 text = transcribe(model, "audio.wav", task="sqa", question="What is the speaker talking about?")
+```
 
-# Summarize dialogue
-text = transcribe(model, "audio.wav", task="summarize")
+### Batch Inference
+
+Process multiple audio files with GPU-batched decoding for higher throughput:
+
+```python
+from mlx_meralion import load_model, batch_transcribe
+
+model = load_model("MERaLiON/MERaLiON-2-10B-MLX")
+
+results = batch_transcribe(model, ["a.wav", "b.wav", "c.wav", "d.wav"])
+for text in results:
+    print(text)
 ```
 
 ### CLI
 
 ```bash
-# ASR (default task)
 mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --task asr
-
-# Translation
 mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --task translate_zh
-
-# Custom instruction
-mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --instruction "Summarize this in one sentence."
 ```
 
 ## Supported Tasks
@@ -77,13 +77,23 @@ mlx-meralion --model MERaLiON/MERaLiON-2-10B-MLX --audio audio.wav --instruction
 | MERaLiON-2-10B-MLX | ~10 GB | 16+ GB | Best | [MERaLiON/MERaLiON-2-10B-MLX](https://huggingface.co/MERaLiON/MERaLiON-2-10B-MLX) |
 | MERaLiON-2-3B-MLX | ~6 GB | 8+ GB | Good | [MERaLiON/MERaLiON-2-3B-MLX](https://huggingface.co/MERaLiON/MERaLiON-2-3B-MLX) |
 
+## Batch Inference Benchmark
+
+Measured on Apple M4 Pro (24 GB) with MERaLiON-2-10B-MLX, 8 audio samples (~25s each), max 256 tokens. Correctness validated by comparing batch outputs against sequential outputs token-for-token.
+
+| Method | B | Time | Throughput | Speedup | Correct |
+|--------|---|------|------------|---------|---------|
+| Sequential (for-loop) | 8 | 38.96s | 0.21 aud/s | 1.00x | --- |
+| `batch_transcribe` | 4 | 13.93s | 0.29 aud/s | 1.40x | PASS |
+| `batch_transcribe` | 8 | 23.25s | 0.34 aud/s | 1.68x | PASS |
+
 ## Features
 
 - **Apple Silicon native**: Runs entirely on MLX with GPU acceleration
-- **N-gram blocking**: Automatically prevents repetitive output (matching HuggingFace quality)
+- **Batch inference**: GPU-batched decoding via `BatchKVCache` for multi-audio throughput
+- **N-gram blocking**: Prevents repetitive output (matching HuggingFace quality)
 - **Smart chunking**: Long audio split at 30s boundaries; short tails merged to prevent hallucination
-- **Auto-download**: HuggingFace models are downloaded and cached automatically
-- **Multiple tasks**: ASR, translation, QA, summarization, and more
+- **Auto-download**: Models downloaded and cached from HuggingFace automatically
 
 ## Architecture
 
